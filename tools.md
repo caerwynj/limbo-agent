@@ -19,8 +19,8 @@ edit
   - oldText: Exact text to find and replace (must match exactly)
   - newText: New text to replace the old text with
 
-bash
-  Execute a bash command in the current working directory. Returns stdout
+shell
+  Execute an inferno shell command in the current working directory. Returns stdout
   and stderr. Optionally provide a timeout in seconds.
-  - command: Bash command to execute
+  - command: Shell command to execute
   - timeout: Timeout in seconds (optional, no default timeout)
