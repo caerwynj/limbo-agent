@@ -109,7 +109,7 @@ build_system_prompt(): string
 		if(n > 0)
 			system_prompt = string buf[0:n];
 	} else {
-		system_prompt = "You are a helpful AI assistant connected to an Inferno OS environment. " + "You have access to the following tools to accomplish the user's goals. " + "To invoke a tool, you MUST output a raw JSON block wrapped in exactly ```json and ```.\n" + "Example:\n```json\n{\n  \"name\": \"bash\",\n  \"arguments\": {\n    \"command\": \"ls -la\"\n  }\n}\n```\n\n";
+		system_prompt = "You are a helpful AI assistant connected to an Inferno OS environment. " + "You have access to the following tools to accomplish the user's goals. " + "To invoke a tool, you MUST output a raw JSON block wrapped in exactly ```json and ```.\n" + "Example:\n```json\n{\n  \"name\": \"shell\",\n  \"arguments\": {\n    \"command\": \"ls -la\"\n  }\n}\n```\n\n";
 	}
 
 	sys->print("Reading tools.md...\n");
@@ -126,7 +126,7 @@ build_system_prompt(): string
 			tools_doc += string buf[0:n];
 	}
 	else {
-		tools_doc += "read, write, edit, bash";
+		tools_doc += "read, write, edit, shell";
 	}
 
 	return system_prompt + "\n" + tools_doc;
@@ -158,27 +158,43 @@ agent_loop(ctxt: ref Draw->Context, sys_prompt: string)
 		history = append_msg(history, ref Message("user", input));
 
 		for(;;) {
+			sys->print("[Trace] Enforcing context limit...\n");
 			history = enforce_context_limit(sys_prompt, history);
+			sys->print("[Trace] Building prompt...\n");
 			prompt := build_prompt(sys_prompt, history);
 
+			sys->print("[Trace] Sending reset to ctl...\n");
 			send_reset();
+			sys->print("[Trace] Opening data file for writing...\n");
 			fd := sys->open(sys->sprint("/n/llm/%s/data", llmconn), Sys->OWRITE);
 			if(fd != nil) {
-				sys->fprint(fd, "%s", prompt);
+				sys->print("[Trace] Writing prompt to data via bufio...\n");
+				bfd := bufio->fopen(fd, Sys->OWRITE);
+				if(bfd != nil) {
+					bfd.puts(prompt);
+					bfd.flush();
+					bfd.close();
+				}
 				fd = nil;
+				sys->print("[Trace] Logging transcript...\n");
+				log_transcript(prompt);
 			}
 			else {
 				sys->print("Error writing to data file: %r\n");
 				break;
 			}
 
+			sys->print("[Trace] Pumping assistant...\n");
 			(tool_called, asst_msg, tool_res) := pump_assistant(ctxt);
+			sys->print("[Trace] Pump completed. tool_called: %d\n", tool_called);
+			
 			if(len asst_msg > 0)
 				history = append_msg(history, ref Message("assistant", asst_msg));
 
 			if(!tool_called)
 				break;
 
+			sys->print("[Trace] Appending tool result to user history...\n");
 			history = append_msg(history, ref Message("user", "\n<tool_result>\n" + tool_res + "\n</tool_result>\n"));
 		}
 	}
@@ -212,6 +228,7 @@ pump_assistant(ctxt: ref Draw->Context): (int, string, string)
 			if(len json_buf >= 3 && json_buf[len json_buf - 3:] == "```") {
 				capture_mode = 0;
 				json_body := json_buf[0:len json_buf - 3];
+				afd.close();
 				afd = nil;
 				res := execute_tool(ctxt, json_body);
 				return (1, full_msg, res);
@@ -219,6 +236,7 @@ pump_assistant(ctxt: ref Draw->Context): (int, string, string)
 			else if(len json_buf >= 12 && json_buf[len json_buf - 12:] == "</tool_call>") {
 				capture_mode = 0;
 				json_body := json_buf[0:len json_buf - 12];
+				afd.close();
 				afd = nil;
 				res := execute_tool(ctxt, json_body);
 				return (1, full_msg, res);
@@ -247,6 +265,8 @@ pump_assistant(ctxt: ref Draw->Context): (int, string, string)
 			}
 		}
 	}
+	afd.close();
+	afd = nil;
 	return (0, full_msg, "");
 }
 
@@ -302,12 +322,12 @@ execute_tool(ctxt: ref Draw->Context, tool_json: string): string
 			result = "Error: missing 'path', 'oldText', or 'newText' argument";
 		else
 			result = tool_edit(path, oldText, newText);
-	"bash" =>
+	"shell" =>
 		cmd := get_string_arg(args_val, "command");
 		if(cmd == nil)
 			result = "Error: missing 'command' argument";
 		else
-			result = tool_bash(ctxt, cmd);
+			result = tool_shell(ctxt, cmd);
 	* =>
 		result = sys->sprint("Error: Unknown tool '%s'", name);
 	}
@@ -382,7 +402,7 @@ tool_edit(path: string, oldText: string, newText: string): string
 	return tool_write(path, new_content);
 }
 
-tool_bash(ctxt: ref Draw->Context, cmd: string): string
+tool_shell(ctxt: ref Draw->Context, cmd: string): string
 {
 	sys->print("Running shell command: %s\n", cmd);
 
@@ -456,17 +476,35 @@ send_reset()
 
 build_prompt(sys_prompt: string, history: list of ref Message): string
 {
-	p := "<start_of_turn>user\n" + sys_prompt + "<end_of_turn>\n";
+	p := "<start_of_turn>user\n" + sys_prompt + "\n";
+
+	in_user := 1;
 
 	q := history;
 	while(q != nil) {
 		m := hd q;
 		role := m.role;
-		if(role == "assistant")
-			role = "model";
-		p += "<start_of_turn>" + role + "\n" + m.content + "<end_of_turn>\n";
+		
+		if (role == "user") {
+			if (!in_user) {
+				p += "<start_of_turn>user\n";
+				in_user = 1;
+			}
+			p += m.content + "\n";
+		} else {
+			if (in_user) {
+				p += "<end_of_turn>\n";
+				in_user = 0;
+			}
+			p += "<start_of_turn>model\n" + m.content + "<end_of_turn>\n";
+		}
 		q = tl q;
 	}
+	
+	if (in_user) {
+		p += "<end_of_turn>\n";
+	}
+
 	p += "<start_of_turn>model\n";
 	return p;
 }
@@ -493,4 +531,16 @@ enforce_context_limit(sys_prompt: string, history: list of ref Message): list of
 		history = tl history;
 	}
 	return history;
+}
+
+log_transcript(prompt: string)
+{
+	logfd := sys->open("transcript.log", Sys->OWRITE);
+	if(logfd == nil)
+		logfd = sys->create("transcript.log", Sys->OWRITE, 8r666);
+	if(logfd != nil) {
+		sys->seek(logfd, big 0, Sys->SEEKEND);
+		# We can use the current time if we load Daytime or just a separator
+		sys->fprint(logfd, "========== PROMPT ==========\n%s\n============================\n\n", prompt);
+	}
 }

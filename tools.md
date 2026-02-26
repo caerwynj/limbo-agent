@@ -1,7 +1,5 @@
 read
-  Read the contents of a file. Supports text files and images (jpg, png,
-  gif, webp). Images are sent as attachments. For text files, defaults to
-  first 2000 lines. Use offset/limit for large files.
+  Read the contents of a text file. Defaults to first 2000 lines. Use offset/limit for large files.
   - path: Path to the file to read (relative or absolute)
   - offset: Line number to start reading from (1-indexed)
   - limit: Maximum number of lines to read
