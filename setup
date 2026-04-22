@@ -1,0 +1,10 @@
+# run setup
+load std
+or {ftest -e /net/dns} {ftest -e /env/emuhost} {ndb/dns}
+or {ftest -e /net/cs} {ndb/cs}
+echo 'mounting...'
+OPENROUTER_API_KEY=`{cat $home/orkey}
+mkdir -p /n/llm
+or {ftest -e /n/llm/info} {llmfs -M moonshotai/kimi-k2.6}
+ls /n/llm
+echo 'running agent...'

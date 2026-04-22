@@ -1,0 +1,268 @@
+.TH AGENT 1
+.SH NAME
+agent \- interactive LLM coding assistant
+.SH SYNOPSIS
+.B agent
+[
+.I conn
+]
+.SH DESCRIPTION
+.I Agent
+is an interactive coding assistant that drives a large language model
+through a filesystem interface and exposes a small set of tools for
+reading, editing, and exploring the local system.
+.PP
+The model is reached through a 9P service mounted at
+.BR /n/llm .
+If
+.I conn
+is supplied it names an existing session (a numeric id under
+.BR /n/llm );
+otherwise
+.I agent
+opens
+.B /n/llm/clone
+to acquire a fresh connection and uses that for the duration of the
+session.
+Before starting,
+.I agent
+reads
+.B /n/llm/info
+to discover the model's context window and caps its own history accordingly.
+.PP
+Each iteration reads a line from standard input, appends it to the
+conversation history, and writes the full prompt (system prompt plus
+turn-marked history) to
+.BI /n/llm/ conn /data \fR.
+It then reads the model's reply from the same file, streaming
+non-tool text to standard output.
+If the reply contains a tool call, it is parsed, dispatched, and the
+result is fed back to the model as another turn; the loop continues
+until the model produces a reply with no tool call.
+.PP
+The system prompt is read from
+.B /lib/llm/system.md
+if present, otherwise from
+.B ./system.md
+in the working directory, with a built-in fallback if neither exists.
+The list of available tools is appended from
+.B /lib/llm/tools.md
+or
+.BR ./tools.md .
+.SS Tool calls
+To invoke a tool the model emits a JSON block wrapped in exactly
+.B ```json
+and
+.BR ``` ,
+with fields
+.B name
+and
+.BR arguments .
+The alternative framings
+.B <tool_call>\fI...\fB</tool_call>
+and
+.B ```tool_call
+are also recognised.
+For example:
+.IP
+.EX
+```json
+{
+  "name": "read",
+  "arguments": {
+    "path": "agent.b",
+    "offset": 100,
+    "limit": 40
+  }
+}
+```
+.EE
+.SS Input
+Input lines are treated as user turns.
+Two prefixes are special:
+.TP 10
+.B !
+The remainder of the line is passed to
+.IR sh (1)
+and runs locally without touching the model.
+.TP
+.B exit
+.PD 0
+.TP
+.B quit
+Terminate the session.
+.PD
+.SH TOOLS
+.TP
+.B read
+Read a file.
+Arguments:
+.I path
+(required),
+.I offset
+(1-indexed line, default 1),
+.I limit
+(default 2000).
+.TP
+.B write
+Create or overwrite a file, creating parent directories as needed.
+Arguments:
+.I path
+and
+.IR content .
+.TP
+.B edit
+Replace an exact, unique occurrence of
+.I oldText
+with
+.IR newText .
+The edit is refused if
+.I oldText
+is not found or matches more than once.
+Arguments:
+.IR path ,
+.IR oldText ,
+.IR newText .
+.TP
+.B multi_edit
+Apply an ordered list of
+.B edit
+operations to one file atomically.
+Each step sees the output of prior steps; if any step fails, the file
+is left untouched.
+Arguments:
+.I path
+and
+.I edits
+(a JSON array of
+.BI { oldText , newText }
+objects).
+.TP
+.B shell
+Run
+.I command
+under
+.IR sh (1)
+with standard output and standard error captured together.
+Optional
+.I timeout
+in seconds; if the command does not finish in time it is abandoned and
+an error is returned.
+.TP
+.B ls
+List a directory, or stat a single file.
+Each entry is printed as
+.BI "kind length name\fR,
+with
+.B d
+for directories and
+.B -
+for regular files.
+Argument:
+.IR path .
+.TP
+.B glob
+Walk
+.I dir
+recursively and return basenames matching
+.IR pattern .
+The pattern accepts a single
+.B *
+wildcard as a prefix or suffix (for example
+.B *.b
+or
+.BR test_* ).
+Results are capped at 500 entries.
+.TP
+.B grep
+Search for
+.I pattern
+(a regular expression, see
+.IR regex (2))
+in
+.IR path ,
+which may be a shell glob such as
+.BR /appl/cmd/*.b .
+Internally dispatches to
+.IR grep (1).
+.SH EXAMPLES
+Start against a freshly cloned session:
+.IP
+.EX
+agent
+.EE
+.PP
+Attach to session
+.B 3
+already present under
+.BR /n/llm :
+.IP
+.EX
+agent 3
+.EE
+.PP
+Run a local shell command without consulting the model:
+.IP
+.EX
+> ! ls -l /appl/cmd
+.EE
+.SH FILES
+.TF /n/llm/\fIconn\fB/data
+.TP
+.B /n/llm/clone
+Read to acquire a new session id.
+.TP
+.BI /n/llm/ conn /ctl
+Control file; the string
+.B reset
+is written before each prompt to clear the server's context.
+.TP
+.BI /n/llm/ conn /data
+Write prompt, read reply.
+.TP
+.B /n/llm/info
+Model metadata; parsed for
+.BR context_length .
+.TP
+.B /lib/llm/system.md
+.PD 0
+.TP
+.B ./system.md
+.PD
+System prompt, first match wins.
+.TP
+.B /lib/llm/tools.md
+.PD 0
+.TP
+.B ./tools.md
+.PD
+Tool documentation appended to the system prompt.
+.TP
+.B ./transcript.log
+Every outgoing prompt is appended here, framed by a banner.
+.SH SOURCE
+.B /appl/cmd/agent.b
+.SH "SEE ALSO"
+.IR sh (1),
+.IR grep (1),
+.IR regex (2)
+.SH BUGS
+A
+.B shell
+call that exceeds its
+.I timeout
+is abandoned, not killed; the subprocess continues to run until it
+exits of its own accord.
+.PP
+The
+.B glob
+pattern syntax is a narrow subset of
+.IR sh (1)
+globbing: one
+.B *
+only, as a prefix or suffix of the basename.
+.PP
+Context-window accounting estimates one token per three characters and
+drops the oldest history entry when the estimate exceeds the reported
+.BR context_length ;
+it does not attempt real tokenisation.
