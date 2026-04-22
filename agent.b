@@ -27,7 +27,7 @@ Message: adt
 };
 
 llmconn: string = "0";
-max_context: int = 4096;
+max_context: int = 1024*64;
 
 init(ctxt: ref Draw->Context, argv: list of string)
 {
@@ -98,7 +98,7 @@ fetch_info()
 build_system_prompt(): string
 {
 	sys->print("Reading system.md...\n");
-	sfd := sys->open("/n/llm/system.md", Sys->OREAD);
+	sfd := sys->open("/lib/llm/system.md", Sys->OREAD);
 	if(sfd == nil)
 		sfd = sys->open("./system.md", Sys->OREAD);
 	
@@ -113,7 +113,7 @@ build_system_prompt(): string
 	}
 
 	sys->print("Reading tools.md...\n");
-	tfd := sys->open("/n/llm/tools.md", Sys->OREAD);
+	tfd := sys->open("/lib/llm/tools.md", Sys->OREAD);
 	if(tfd == nil)
 		tfd = sys->open("./tools.md", Sys->OREAD);
 	
@@ -303,10 +303,12 @@ execute_tool(ctxt: ref Draw->Context, tool_json: string): string
 	case name {
 	"read" =>
 		path := get_string_arg(args_val, "path");
+		offset := get_int_arg(args_val, "offset", 1);
+		limit := get_int_arg(args_val, "limit", 2000);
 		if(path == nil)
 			result = "Error: missing 'path' argument";
 		else
-			result = tool_read(path);
+			result = tool_read(path, offset, limit);
 	"write" =>
 		path := get_string_arg(args_val, "path");
 		content := get_string_arg(args_val, "content");
@@ -322,12 +324,40 @@ execute_tool(ctxt: ref Draw->Context, tool_json: string): string
 			result = "Error: missing 'path', 'oldText', or 'newText' argument";
 		else
 			result = tool_edit(path, oldText, newText);
+	"multi_edit" =>
+		path := get_string_arg(args_val, "path");
+		edits := args_val.get("edits");
+		if(path == nil || edits == nil)
+			result = "Error: missing 'path' or 'edits' argument";
+		else
+			result = tool_multi_edit(path, edits);
 	"shell" =>
 		cmd := get_string_arg(args_val, "command");
+		timeout := get_int_arg(args_val, "timeout", 0);
 		if(cmd == nil)
 			result = "Error: missing 'command' argument";
 		else
-			result = tool_shell(ctxt, cmd);
+			result = tool_shell(ctxt, cmd, timeout);
+	"ls" =>
+		path := get_string_arg(args_val, "path");
+		if(path == nil)
+			result = "Error: missing 'path' argument";
+		else
+			result = tool_ls(path);
+	"glob" =>
+		dir := get_string_arg(args_val, "dir");
+		pattern := get_string_arg(args_val, "pattern");
+		if(dir == nil || pattern == nil)
+			result = "Error: missing 'dir' or 'pattern' argument";
+		else
+			result = tool_glob(dir, pattern);
+	"grep" =>
+		pattern := get_string_arg(args_val, "pattern");
+		path := get_string_arg(args_val, "path");
+		if(pattern == nil || path == nil)
+			result = "Error: missing 'pattern' or 'path' argument";
+		else
+			result = tool_grep(ctxt, pattern, path);
 	* =>
 		result = sys->sprint("Error: Unknown tool '%s'", name);
 	}
@@ -348,23 +378,79 @@ get_string_arg(args: ref JValue, name: string): string
 	return nil;
 }
 
+get_int_arg(args: ref JValue, name: string, dflt: int): int
+{
+	v := args.get(name);
+	if(v == nil)
+		return dflt;
+	if(v.isint()) {
+		pick iv := v {
+		Int =>
+			return int iv.value;
+		}
+	}
+	if(v.isstring()) {
+		pick sv := v {
+		String =>
+			(i, rest) := str->toint(sv.s, 10);
+			if(len rest < len sv.s)
+				return i;
+		}
+	}
+	return dflt;
+}
 
-
-tool_read(path: string): string
+read_all(path: string): (string, string)
 {
 	fd := sys->open(path, Sys->OREAD);
 	if(fd == nil)
+		return (nil, sys->sprint("Could not open %s: %r", path));
+	out := "";
+	chunk := array[8192] of byte;
+	for(;;) {
+		n := sys->read(fd, chunk, len chunk);
+		if(n < 0)
+			return (nil, sys->sprint("read error: %r"));
+		if(n == 0)
+			break;
+		out += string chunk[0:n];
+	}
+	return (out, nil);
+}
+
+tool_read(path: string, offset: int, limit: int): string
+{
+	bfd := bufio->open(path, Sys->OREAD);
+	if(bfd == nil)
 		return sys->sprint("Error: Could not open file %s: %r", path);
 
-	# Naive read up to a certain limit
-	buf := array[8192] of byte;
-	n := sys->read(fd, buf, len buf);
-	if(n < 0)
-		return sys->sprint("Error reading file: %r");
+	if(offset < 1)
+		offset = 1;
+	if(limit <= 0)
+		limit = 2000;
 
-	if(n == 0)
+	out := "";
+	lineno := 0;
+	emitted := 0;
+	for(;;) {
+		line := bfd.gets('\n');
+		if(line == nil)
+			break;
+		lineno++;
+		if(lineno < offset)
+			continue;
+		out += line;
+		emitted++;
+		if(emitted >= limit)
+			break;
+	}
+	bfd.close();
+
+	if(lineno == 0)
 		return "File is empty.";
-	return string buf[0:n];
+	if(emitted == 0)
+		return sys->sprint("No lines in range: file has %d lines, offset=%d.", lineno, offset);
+	return out;
 }
 
 tool_write(path: string, content: string): string
@@ -387,43 +473,228 @@ tool_write(path: string, content: string): string
 
 tool_edit(path: string, oldText: string, newText: string): string
 {
-	content := tool_read(path);
-	if(len content > 5 && content[0:5] == "Error")
-		return content;
+	(content, err) := read_all(path);
+	if(err != nil)
+		return "Error: " + err;
 
-	(n, pieces) := sys->tokenize(content, oldText);
-	# Actually Limbo tokenize splits by *any* char in delim. We need str->splitstr. Let's use string module.
 	(a, b) := str->splitstrl(content, oldText);
 	if(b == nil || len b == 0)
 		return "Error: oldText not found in file.";
 
-	new_content := a + newText + b[len oldText:];
+	after := b[len oldText:];
+	(nil, b2) := str->splitstrl(after, oldText);
+	if(b2 != nil && len b2 > 0)
+		return sys->sprint("Error: oldText matches more than once in %s; provide more surrounding context to make it unique.", path);
+
+	new_content := a + newText + after;
 
 	return tool_write(path, new_content);
 }
 
-tool_shell(ctxt: ref Draw->Context, cmd: string): string
+tool_multi_edit(path: string, edits: ref JValue): string
+{
+	if(edits == nil || !edits.isarray())
+		return "Error: 'edits' must be a JSON array of {oldText, newText} objects";
+
+	arr: array of ref JValue;
+	pick ev := edits {
+	Array =>
+		arr = ev.a;
+	}
+
+	(content, err) := read_all(path);
+	if(err != nil)
+		return "Error: " + err;
+
+	for(i := 0; i < len arr; i++) {
+		e := arr[i];
+		if(e == nil || !e.isobject())
+			return sys->sprint("Error: edit %d is not an object", i);
+		oldText := get_string_arg(e, "oldText");
+		newText := get_string_arg(e, "newText");
+		if(oldText == nil || newText == nil)
+			return sys->sprint("Error: edit %d missing oldText or newText", i);
+
+		(a, b) := str->splitstrl(content, oldText);
+		if(b == nil || len b == 0)
+			return sys->sprint("Error: edit %d oldText not found", i);
+		after := b[len oldText:];
+		(nil, b2) := str->splitstrl(after, oldText);
+		if(b2 != nil && len b2 > 0)
+			return sys->sprint("Error: edit %d oldText matches more than once; provide more context", i);
+		content = a + newText + after;
+	}
+
+	return tool_write(path, content);
+}
+
+tool_shell(ctxt: ref Draw->Context, cmd: string, timeout: int): string
 {
 	sys->print("Running shell command: %s\n", cmd);
 
 	tmp := "/tmp/sh_out_" + string sys->millisec();
+	full := "{ " + cmd + " } > " + tmp + " >[2=1]";
 
-	# Evaluate inside the native inferno shell, redirecting stdout and stderr to the tmp file
-	res := sh->system(ctxt, "{ " + cmd + " } > " + tmp + " >[2=1]");
+	res: string;
+	if(timeout <= 0) {
+		res = sh->system(ctxt, full);
+	}
+	else {
+		done := chan[1] of string;
+		timer := chan[1] of int;
+		spawn run_shell(ctxt, full, done);
+		spawn timer_fn(timeout * 1000, timer);
+		alt {
+			r := <-done =>
+				res = r;
+			<-timer =>
+				sys->remove(tmp);
+				return sys->sprint("Error: command timed out after %ds", timeout);
+		}
+	}
 
-	output := tool_read(tmp);
+	(output, rerr) := read_all(tmp);
 	sys->remove(tmp);
-
-	if(len output > 14 && output[0:14] == "Error: Could n")
+	if(rerr != nil)
 		output = "";
 
-	if(res != nil) {
+	if(res != nil)
 		return "Exit Status: " + res + "\n" + output;
-	}
 
 	if(len output == 0)
 		return "Command executed with no output.";
 	return output;
+}
+
+run_shell(ctxt: ref Draw->Context, cmd: string, done: chan of string)
+{
+	r := sh->system(ctxt, cmd);
+	done <-= r;
+}
+
+timer_fn(ms: int, c: chan of int)
+{
+	sys->sleep(ms);
+	c <-= 1;
+}
+
+tool_ls(path: string): string
+{
+	(ok, d) := sys->stat(path);
+	if(ok < 0)
+		return sys->sprint("Error: stat %s: %r", path);
+	if((d.mode & Sys->DMDIR) == 0)
+		return fmt_dir_entry(d) + "\n";
+
+	fd := sys->open(path, Sys->OREAD);
+	if(fd == nil)
+		return sys->sprint("Error: open %s: %r", path);
+
+	out := "";
+	for(;;) {
+		(n, a) := sys->dirread(fd);
+		if(n <= 0)
+			break;
+		for(i := 0; i < len a; i++)
+			out += fmt_dir_entry(a[i]) + "\n";
+	}
+	if(out == "")
+		return "Directory is empty.\n";
+	return out;
+}
+
+fmt_dir_entry(d: Sys->Dir): string
+{
+	kind := "-";
+	if((d.mode & Sys->DMDIR) != 0)
+		kind = "d";
+	return sys->sprint("%s %8bd %s", kind, d.length, d.name);
+}
+
+tool_glob(dir: string, pattern: string): string
+{
+	matches := glob_walk(dir, pattern, nil);
+	if(matches == nil)
+		return "No matches.\n";
+	out := "";
+	count := 0;
+	truncated := 0;
+	while(matches != nil) {
+		if(count >= 500) {
+			truncated = 1;
+			break;
+		}
+		out += hd matches + "\n";
+		matches = tl matches;
+		count++;
+	}
+	if(truncated)
+		out += "... (truncated at 500 results)\n";
+	return out;
+}
+
+glob_walk(dir: string, pattern: string, acc: list of string): list of string
+{
+	fd := sys->open(dir, Sys->OREAD);
+	if(fd == nil)
+		return acc;
+	for(;;) {
+		(n, a) := sys->dirread(fd);
+		if(n <= 0)
+			break;
+		for(i := 0; i < len a; i++) {
+			name := a[i].name;
+			full := dir;
+			if(len full > 0 && full[len full - 1] != '/')
+				full += "/";
+			full += name;
+			if((a[i].mode & Sys->DMDIR) != 0)
+				acc = glob_walk(full, pattern, acc);
+			else if(glob_match(pattern, name))
+				acc = full :: acc;
+		}
+	}
+	return acc;
+}
+
+glob_match(pat: string, name: string): int
+{
+	if(pat == "*")
+		return 1;
+	if(len pat >= 2 && pat[0] == '*') {
+		suf := pat[1:];
+		if(str->contains(suf, "*"))
+			return pat == name;
+		if(len name < len suf)
+			return 0;
+		return name[len name - len suf:] == suf;
+	}
+	if(len pat >= 2 && pat[len pat - 1] == '*') {
+		pre := pat[0:len pat - 1];
+		if(len name < len pre)
+			return 0;
+		return name[0:len pre] == pre;
+	}
+	return pat == name;
+}
+
+tool_grep(ctxt: ref Draw->Context, pattern: string, path: string): string
+{
+	cmd := "grep -n " + shquote(pattern) + " " + shquote(path);
+	return tool_shell(ctxt, cmd, 0);
+}
+
+shquote(s: string): string
+{
+	out := "'";
+	for(i := 0; i < len s; i++) {
+		if(s[i] == '\'')
+			out += "'\\''";
+		else
+			out += s[i:i+1];
+	}
+	out += "'";
+	return out;
 }
 
 mkdirs(path: string): int

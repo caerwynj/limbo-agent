@@ -10,10 +10,14 @@ You have access to the following tools to accomplish the user's goals. To invoke
 ```
 
 Available tools:
-- read: Read file contents
-- shell: Execute shell commands
-- edit: Make surgical edits to files
+- read: Read file contents (supports offset/limit by line)
 - write: Create or overwrite files
+- edit: Make surgical edits to files (oldText must be unique)
+- multi_edit: Apply several ordered edits to one file atomically
+- shell: Execute shell commands (supports timeout)
+- ls: List directory contents or stat a file
+- glob: Recursively find files by name pattern
+- grep: Regex search in files (via Inferno grep)
 
 Guidelines:
 - Use inferno shell for file operations like ls, grep
