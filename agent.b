@@ -20,14 +20,16 @@ Agent: module
 	init: fn(ctxt: ref Draw->Context, argv: list of string);
 };
 
-Message: adt
+ToolCall: adt
 {
-	role: string;
-	content: string;
+	id:	string;
+	name:	string;
+	args:	ref JValue;
 };
 
 llmconn: string = "0";
 max_context: int = 1024*64;
+last_turn: int = -1;
 
 init(ctxt: ref Draw->Context, argv: list of string)
 {
@@ -38,26 +40,15 @@ init(ctxt: ref Draw->Context, argv: list of string)
 	json->init(bufio);
 	sh = load Sh Sh->PATH;
 
-
 	if(argv != nil)
 		argv = tl argv;
 	if(argv != nil) {
 		llmconn = hd argv;
 	}
 	else {
-		cfd := sys->open("/n/llm/clone", Sys->OREAD);
-		if(cfd == nil) {
-			sys->print("Error: Could not open /n/llm/clone: %r\n");
+		llmconn = acquire_conn();
+		if(llmconn == nil)
 			return;
-		}
-		buf := array[32] of byte;
-		n := sys->read(cfd, buf, len buf);
-		if(n > 0)
-			llmconn = string buf[0:n];
-		else {
-			sys->print("Error reading /n/llm/clone\n");
-			return;
-		}
 		sys->print("Acquired active session connection from clone.\n");
 	}
 
@@ -65,8 +56,31 @@ init(ctxt: ref Draw->Context, argv: list of string)
 
 	fetch_info();
 
-	sys_prompt := build_system_prompt();
-	agent_loop(ctxt, sys_prompt);
+	sys_prompt := load_or(list of {"/lib/llm/system.md", "./system.md"}, default_system_prompt());
+	tools_md := load_or(list of {"/lib/llm/tools.md", "./tools.md"}, default_tools_md());
+
+	if(!setup_session(sys_prompt, tools_md)) {
+		sys->print("Error: failed to set up session.\n");
+		return;
+	}
+
+	agent_loop(ctxt);
+}
+
+acquire_conn(): string
+{
+	cfd := sys->open("/n/llm/clone", Sys->OREAD);
+	if(cfd == nil) {
+		sys->print("Error: Could not open /n/llm/clone: %r\n");
+		return nil;
+	}
+	buf := array[32] of byte;
+	n := sys->read(cfd, buf, len buf);
+	if(n <= 0) {
+		sys->print("Error reading /n/llm/clone\n");
+		return nil;
+	}
+	return string buf[0:n];
 }
 
 fetch_info()
@@ -74,68 +88,54 @@ fetch_info()
 	fd := sys->open("/n/llm/info", Sys->OREAD);
 	if(fd == nil)
 		return;
-
 	buf := array[1024] of byte;
 	n := sys->read(fd, buf, len buf);
-	if(n > 0) {
-		content := string buf[0:n];
-		(num_lines, lines) := sys->tokenize(content, "\n");
-		while(lines != nil) {
-			line := hd lines;
-			if(len line > 15 && line[0:15] == "context_length:") {
-				val := line[15:];
-				while(len val > 0 && (val[0] == ' ' || val[0] == '\t'))
-					val = val[1:];
-				max_context = int val;
-				sys->print("Loaded context length: %d\n", max_context);
-				break;
-			}
-			lines = tl lines;
+	if(n <= 0)
+		return;
+	content := string buf[0:n];
+	(nil, lines) := sys->tokenize(content, "\n");
+	while(lines != nil) {
+		line := hd lines;
+		if(len line > 15 && line[0:15] == "context_length:") {
+			val := line[15:];
+			while(len val > 0 && (val[0] == ' ' || val[0] == '\t'))
+				val = val[1:];
+			max_context = int val;
+			sys->print("Loaded context length: %d\n", max_context);
+			break;
 		}
+		lines = tl lines;
 	}
 }
 
-build_system_prompt(): string
+# Try each path in turn; return file contents, or fallback if none exist.
+load_or(paths: list of string, fallback: string): string
 {
-	sys->print("Reading system.md...\n");
-	sfd := sys->open("/lib/llm/system.md", Sys->OREAD);
-	if(sfd == nil)
-		sfd = sys->open("./system.md", Sys->OREAD);
-	
-	system_prompt := "";
-	if(sfd != nil) {
-		buf := array[8192] of byte;
-		n := sys->read(sfd, buf, len buf);
-		if(n > 0)
-			system_prompt = string buf[0:n];
-	} else {
-		system_prompt = "You are a helpful AI assistant connected to an Inferno OS environment. " + "You have access to the following tools to accomplish the user's goals. " + "To invoke a tool, you MUST output a raw JSON block wrapped in exactly ```json and ```.\n" + "Example:\n```json\n{\n  \"name\": \"shell\",\n  \"arguments\": {\n    \"command\": \"ls -la\"\n  }\n}\n```\n\n";
+	while(paths != nil) {
+		(s, err) := read_all(hd paths);
+		if(err == nil)
+			return s;
+		paths = tl paths;
 	}
-
-	sys->print("Reading tools.md...\n");
-	tfd := sys->open("/lib/llm/tools.md", Sys->OREAD);
-	if(tfd == nil)
-		tfd = sys->open("./tools.md", Sys->OREAD);
-	
-	tools_doc := "Available tools:\n\n";
-
-	if(tfd != nil) {
-		buf := array[8192] of byte;
-		n := sys->read(tfd, buf, len buf);
-		if(n > 0)
-			tools_doc += string buf[0:n];
-	}
-	else {
-		tools_doc += "read, write, edit, shell";
-	}
-
-	return system_prompt + "\n" + tools_doc;
+	return fallback;
 }
 
-agent_loop(ctxt: ref Draw->Context, sys_prompt: string)
+setup_session(sys_prompt, tools_md: string): int
+{
+	if(!write_file(sys->sprint("/n/llm/%s/system", llmconn), sys_prompt)) {
+		sys->print("Error writing system prompt: %r\n");
+		return 0;
+	}
+	if(!write_file(sys->sprint("/n/llm/%s/tools", llmconn), tools_md)) {
+		sys->print("Error writing tools: %r\n");
+		return 0;
+	}
+	return 1;
+}
+
+agent_loop(ctxt: ref Draw->Context)
 {
 	stdin := bufio->fopen(sys->fildes(0), Sys->OREAD);
-	history: list of ref Message = nil;
 
 	for(;;) {
 		sys->print("\n> ");
@@ -147,6 +147,7 @@ agent_loop(ctxt: ref Draw->Context, sys_prompt: string)
 		if(input == "exit" || input == "quit")
 			break;
 
+		# host shell escape
 		if(len input > 0 && input[0] == '!') {
 			cmd := input[1:];
 			err := sh->system(ctxt, cmd);
@@ -155,262 +156,134 @@ agent_loop(ctxt: ref Draw->Context, sys_prompt: string)
 			continue;
 		}
 
-		history = append_msg(history, ref Message("user", input));
+		# /reset clears server-side history
+		if(input == "/reset") {
+			send_ctl("reset");
+			# re-establish system + tools after reset
+			sys_prompt := load_or(list of {"/lib/llm/system.md", "./system.md"}, default_system_prompt());
+			tools_md := load_or(list of {"/lib/llm/tools.md", "./tools.md"}, default_tools_md());
+			setup_session(sys_prompt, tools_md);
+			last_turn = -1;
+			sys->print("[reset]\n");
+			continue;
+		}
 
+		# allocate user turn and write content
+		ut := alloc_turn();
+		if(ut < 0) {
+			sys->print("Error: could not allocate turn\n");
+			continue;
+		}
+		write_field(ut, "role", "user");
+		write_field(ut, "content", input);
+		last_turn = ut;
+		log_transcript("user", input);
+
+		# tool-call loop
 		for(;;) {
-			sys->print("[Trace] Enforcing context limit...\n");
-			history = enforce_context_limit(sys_prompt, history);
-			sys->print("[Trace] Building prompt...\n");
-			prompt := build_prompt(sys_prompt, history);
-
-			sys->print("[Trace] Sending reset to ctl...\n");
-			send_reset();
-			sys->print("[Trace] Opening data file for writing...\n");
-			fd := sys->open(sys->sprint("/n/llm/%s/data", llmconn), Sys->OWRITE);
-			if(fd != nil) {
-				sys->print("[Trace] Writing prompt to data via bufio...\n");
-				bfd := bufio->fopen(fd, Sys->OWRITE);
-				if(bfd != nil) {
-					bfd.puts(prompt);
-					bfd.flush();
-					bfd.close();
+			if(!send_ctl("send")) {
+				sys->print("Error: ctl send failed: %r\n");
+				break;
+			}
+			asst := last_turn + 1;
+			finish := read_field(asst, "finish_reason");
+			content := read_field(asst, "content");
+			sys->print("%s\n", content);
+			log_transcript("assistant", content);
+			last_turn = asst;
+			if(finish != "tool_calls")
+				break;
+			tc_text := read_field(asst, "tool_calls");
+			(calls, perr) := parse_tool_calls(tc_text);
+			if(perr != nil) {
+				sys->print("[tool_calls parse error: %s]\n", perr);
+				break;
+			}
+			for(cl := calls; cl != nil; cl = tl cl) {
+				call := hd cl;
+				sys->print("[tool] %s\n", call.name);
+				result := dispatch_tool(ctxt, call.name, call.args);
+				tt := alloc_turn();
+				if(tt < 0) {
+					sys->print("Error: could not allocate tool turn\n");
+					break;
 				}
-				fd = nil;
-				sys->print("[Trace] Logging transcript...\n");
-				log_transcript(prompt);
+				write_field(tt, "role", "tool");
+				write_field(tt, "tool_call_id", call.id);
+				write_field(tt, "content", result);
+				last_turn = tt;
+				log_transcript(sys->sprint("tool/%s", call.name), result);
 			}
-			else {
-				sys->print("Error writing to data file: %r\n");
-				break;
-			}
-
-			sys->print("[Trace] Pumping assistant...\n");
-			(tool_called, asst_msg, tool_res) := pump_assistant(ctxt);
-			sys->print("[Trace] Pump completed. tool_called: %d\n", tool_called);
-			
-			if(len asst_msg > 0)
-				history = append_msg(history, ref Message("assistant", asst_msg));
-
-			if(!tool_called)
-				break;
-
-			sys->print("[Trace] Appending tool result to user history...\n");
-			history = append_msg(history, ref Message("user", "\n<tool_result>\n" + tool_res + "\n</tool_result>\n"));
 		}
 	}
 }
 
-pump_assistant(ctxt: ref Draw->Context): (int, string, string)
+# --- llmfs I/O helpers --------------------------------------------------
+
+alloc_turn(): int
 {
-	afd := bufio->fopen(sys->open(sys->sprint("/n/llm/%s/data", llmconn), Sys->OREAD), Sys->OREAD);
-	if(afd == nil) {
-		sys->print("Error: Could not open assistant output file: %r\n");
-		return (0, "", "");
-	}
+	cfd := sys->open(sys->sprint("/n/llm/%s/messages/clone", llmconn), Sys->OREAD);
+	if(cfd == nil)
+		return -1;
+	buf := array[16] of byte;
+	n := sys->read(cfd, buf, len buf);
+	if(n <= 0)
+		return -1;
+	return int string buf[0:n];
+}
 
-	capture_mode := 0;
-	json_buf := "";
-	full_msg := "";
+write_field(turn: int, field, value: string): int
+{
+	return write_file(sys->sprint("/n/llm/%s/messages/%d/%s", llmconn, turn, field), value);
+}
 
-	for(;;) {
-		buf := array[1] of byte;
-		n := afd.read(buf, 1);
+read_field(turn: int, field: string): string
+{
+	path := sys->sprint("/n/llm/%s/messages/%d/%s", llmconn, turn, field);
+	(s, nil) := read_all(path);
+	return s;
+}
+
+send_ctl(cmd: string): int
+{
+	fd := sys->open(sys->sprint("/n/llm/%s/ctl", llmconn), Sys->OWRITE);
+	if(fd == nil)
+		return 0;
+	buf := array of byte cmd;
+	if(sys->write(fd, buf, len buf) != len buf)
+		return 0;
+	return 1;
+}
+
+write_file(path, content: string): int
+{
+	fd := sys->open(path, Sys->OWRITE | Sys->OTRUNC);
+	if(fd == nil)
+		fd = sys->create(path, Sys->OWRITE, 8r666);
+	if(fd == nil)
+		return 0;
+	buf := array of byte content;
+	off := 0;
+	while(off < len buf) {
+		n := sys->write(fd, buf[off:], len buf - off);
 		if(n <= 0)
-			break;
-
-		charstr := string buf[0:1];
-		full_msg += charstr;
-
-		if(capture_mode) {
-			json_buf += charstr;
-
-			# Check for ending ``` (or </tool_call> as a fallback)
-			if(len json_buf >= 3 && json_buf[len json_buf - 3:] == "```") {
-				capture_mode = 0;
-				json_body := json_buf[0:len json_buf - 3];
-				afd.close();
-				afd = nil;
-				res := execute_tool(ctxt, json_body);
-				return (1, full_msg, res);
-			}
-			else if(len json_buf >= 12 && json_buf[len json_buf - 12:] == "</tool_call>") {
-				capture_mode = 0;
-				json_body := json_buf[0:len json_buf - 12];
-				afd.close();
-				afd = nil;
-				res := execute_tool(ctxt, json_body);
-				return (1, full_msg, res);
-			}
-		}
-		else {
-			json_buf += charstr;
-			if(len json_buf > 15)
-				json_buf = json_buf[1:];
-
-			if(len json_buf >= 7 && json_buf[len json_buf - 7:] == "```json") {
-				capture_mode = 1;
-				json_buf = "";
-			}
-			else if(len json_buf >= 11 && json_buf[len json_buf - 11:] == "<tool_call>") {
-				capture_mode = 1;
-				json_buf = "";
-			}
-			else if(len json_buf >= 12 && json_buf[len json_buf - 12:] == "```tool_call") {
-				capture_mode = 1;
-				json_buf = "";
-			}
-
-			if(!capture_mode) {
-				sys->print("%s", charstr);
-			}
-		}
+			return 0;
+		off += n;
 	}
-	afd.close();
-	afd = nil;
-	return (0, full_msg, "");
-}
-
-execute_tool(ctxt: ref Draw->Context, tool_json: string): string
-{
-	sys->print("\n[Executing tool call]\n");
-	b := bufio->aopen(array of byte tool_json);
-	if(b == nil) {
-		return "Failed to open JSON buffer";
-	}
-
-	(jv, err) := json->readjson(b);
-	if(jv == nil) {
-		return sys->sprint("JSON parsing failed: %s", err);
-	}
-
-	name_val := jv.get("name");
-	if(name_val == nil ||!name_val.isstring()) {
-		return "Tool call missing valid 'name' field";
-	}
-	name := "";
-	pick v := name_val {
-	String =>
-		name = v.s;
-	}
-
-	args_val := jv.get("arguments");
-	if(args_val == nil ||!args_val.isobject()) {
-		return "Tool call missing 'arguments' object";
-	}
-
-	result := "";
-
-	case name {
-	"read" =>
-		path := get_string_arg(args_val, "path");
-		offset := get_int_arg(args_val, "offset", 1);
-		limit := get_int_arg(args_val, "limit", 2000);
-		if(path == nil)
-			result = "Error: missing 'path' argument";
-		else
-			result = tool_read(path, offset, limit);
-	"write" =>
-		path := get_string_arg(args_val, "path");
-		content := get_string_arg(args_val, "content");
-		if(path == nil || content == nil)
-			result = "Error: missing 'path' or 'content' argument";
-		else
-			result = tool_write(path, content);
-	"edit" =>
-		path := get_string_arg(args_val, "path");
-		oldText := get_string_arg(args_val, "oldText");
-		newText := get_string_arg(args_val, "newText");
-		if(path == nil || oldText == nil || newText == nil)
-			result = "Error: missing 'path', 'oldText', or 'newText' argument";
-		else
-			result = tool_edit(path, oldText, newText);
-	"multi_edit" =>
-		path := get_string_arg(args_val, "path");
-		edits := args_val.get("edits");
-		if(path == nil || edits == nil)
-			result = "Error: missing 'path' or 'edits' argument";
-		else
-			result = tool_multi_edit(path, edits);
-	"shell" =>
-		cmd := get_string_arg(args_val, "command");
-		timeout := get_int_arg(args_val, "timeout", 0);
-		if(cmd == nil)
-			result = "Error: missing 'command' argument";
-		else
-			result = tool_shell(ctxt, cmd, timeout);
-	"ls" =>
-		path := get_string_arg(args_val, "path");
-		if(path == nil)
-			result = "Error: missing 'path' argument";
-		else
-			result = tool_ls(path);
-	"glob" =>
-		dir := get_string_arg(args_val, "dir");
-		pattern := get_string_arg(args_val, "pattern");
-		if(dir == nil || pattern == nil)
-			result = "Error: missing 'dir' or 'pattern' argument";
-		else
-			result = tool_glob(dir, pattern);
-	"grep" =>
-		pattern := get_string_arg(args_val, "pattern");
-		path := get_string_arg(args_val, "path");
-		if(pattern == nil || path == nil)
-			result = "Error: missing 'pattern' or 'path' argument";
-		else
-			result = tool_grep(ctxt, pattern, path);
-	* =>
-		result = sys->sprint("Error: Unknown tool '%s'", name);
-	}
-
-	sys->print("Result:\n%s\n", result);
-	return result;
-}
-
-get_string_arg(args: ref JValue, name: string): string
-{
-	v := args.get(name);
-	if(v != nil && v.isstring()) {
-		pick sval := v {
-		String =>
-			return sval.s;
-		}
-	}
-	return nil;
-}
-
-get_int_arg(args: ref JValue, name: string, dflt: int): int
-{
-	v := args.get(name);
-	if(v == nil)
-		return dflt;
-	if(v.isint()) {
-		pick iv := v {
-		Int =>
-			return int iv.value;
-		}
-	}
-	if(v.isstring()) {
-		pick sv := v {
-		String =>
-			(i, rest) := str->toint(sv.s, 10);
-			if(len rest < len sv.s)
-				return i;
-		}
-	}
-	return dflt;
+	return 1;
 }
 
 read_all(path: string): (string, string)
 {
 	fd := sys->open(path, Sys->OREAD);
 	if(fd == nil)
-		return (nil, sys->sprint("Could not open %s: %r", path));
+		return (nil, sys->sprint("open %s: %r", path));
 	out := "";
 	chunk := array[8192] of byte;
 	for(;;) {
 		n := sys->read(fd, chunk, len chunk);
 		if(n < 0)
-			return (nil, sys->sprint("read error: %r"));
+			return (nil, sys->sprint("read %s: %r", path));
 		if(n == 0)
 			break;
 		out += string chunk[0:n];
@@ -418,17 +291,172 @@ read_all(path: string): (string, string)
 	return (out, nil);
 }
 
-tool_read(path: string, offset: int, limit: int): string
+# --- tool-call response parsing -----------------------------------------
+
+# Parse the JSON array we read from messages/M/tool_calls into a list of
+# ToolCall.  Each element looks like:
+#   {"id":"call_abc","type":"function",
+#    "function":{"name":"X","arguments":"<json string>"}}
+# `arguments` is a *string* (JSON-encoded); we parse it again into an
+# object JValue here so the dispatcher can use get(...).
+parse_tool_calls(s: string): (list of ref ToolCall, string)
+{
+	if(s == "")
+		return (nil, "empty tool_calls");
+	rb := bufio->aopen(array of byte s);
+	if(rb == nil)
+		return (nil, "bufio aopen failed");
+	(jv, jerr) := json->readjson(rb);
+	if(jerr != nil)
+		return (nil, jerr);
+	if(jv == nil || !jv.isarray())
+		return (nil, "tool_calls not an array");
+	out: list of ref ToolCall;
+	pick av := jv {
+	Array =>
+		for(i := 0; i < len av.a; i++) {
+			el := av.a[i];
+			if(el == nil)
+				continue;
+			id := jv_get_string(el, "id");
+			fn_obj := el.get("function");
+			if(fn_obj == nil)
+				continue;
+			name := jv_get_string(fn_obj, "name");
+			args_text := jv_get_string(fn_obj, "arguments");
+			args: ref JValue;
+			if(args_text != "") {
+				ab := bufio->aopen(array of byte args_text);
+				if(ab != nil) {
+					(av2, aerr) := json->readjson(ab);
+					if(aerr == nil)
+						args = av2;
+				}
+			}
+			if(args == nil)
+				args = json->jvobject(nil);
+			out = ref ToolCall(id, name, args) :: out;
+		}
+	}
+	# reverse to original order
+	rev: list of ref ToolCall;
+	for(; out != nil; out = tl out)
+		rev = hd out :: rev;
+	return (rev, nil);
+}
+
+jv_get_string(o: ref JValue, k: string): string
+{
+	if(o == nil)
+		return "";
+	v := o.get(k);
+	if(v == nil)
+		return "";
+	pick x := v {
+	String =>	return x.s;
+	}
+	return "";
+}
+
+# --- tool dispatch ------------------------------------------------------
+
+dispatch_tool(ctxt: ref Draw->Context, name: string, args: ref JValue): string
+{
+	case name {
+	"read" =>
+		path := get_string_arg(args, "path");
+		offset := get_int_arg(args, "offset", 1);
+		limit := get_int_arg(args, "limit", 2000);
+		if(path == nil)
+			return "Error: missing 'path' argument";
+		return tool_read(path, offset, limit);
+	"write" =>
+		path := get_string_arg(args, "path");
+		content := get_string_arg(args, "content");
+		if(path == nil || content == nil)
+			return "Error: missing 'path' or 'content' argument";
+		return tool_write(path, content);
+	"edit" =>
+		path := get_string_arg(args, "path");
+		oldText := get_string_arg(args, "oldText");
+		newText := get_string_arg(args, "newText");
+		if(path == nil || oldText == nil || newText == nil)
+			return "Error: missing 'path', 'oldText', or 'newText' argument";
+		return tool_edit(path, oldText, newText);
+	"multi_edit" =>
+		path := get_string_arg(args, "path");
+		edits := args.get("edits");
+		if(path == nil || edits == nil)
+			return "Error: missing 'path' or 'edits' argument";
+		return tool_multi_edit(path, edits);
+	"shell" =>
+		cmd := get_string_arg(args, "command");
+		timeout := get_int_arg(args, "timeout", 0);
+		if(cmd == nil)
+			return "Error: missing 'command' argument";
+		return tool_shell(ctxt, cmd, timeout);
+	"ls" =>
+		path := get_string_arg(args, "path");
+		if(path == nil)
+			return "Error: missing 'path' argument";
+		return tool_ls(path);
+	"glob" =>
+		dir := get_string_arg(args, "dir");
+		pattern := get_string_arg(args, "pattern");
+		if(dir == nil || pattern == nil)
+			return "Error: missing 'dir' or 'pattern' argument";
+		return tool_glob(dir, pattern);
+	"grep" =>
+		pattern := get_string_arg(args, "pattern");
+		path := get_string_arg(args, "path");
+		if(pattern == nil || path == nil)
+			return "Error: missing 'pattern' or 'path' argument";
+		return tool_grep(ctxt, pattern, path);
+	}
+	return sys->sprint("Error: unknown tool %q", name);
+}
+
+get_string_arg(args: ref JValue, name: string): string
+{
+	if(args == nil)
+		return nil;
+	v := args.get(name);
+	if(v == nil)
+		return nil;
+	pick sval := v {
+	String =>	return sval.s;
+	}
+	return nil;
+}
+
+get_int_arg(args: ref JValue, name: string, dflt: int): int
+{
+	if(args == nil)
+		return dflt;
+	v := args.get(name);
+	if(v == nil)
+		return dflt;
+	pick iv := v {
+	Int =>		return int iv.value;
+	String =>
+		(i, rest) := str->toint(iv.s, 10);
+		if(len rest < len iv.s)
+			return i;
+	}
+	return dflt;
+}
+
+# --- tools --------------------------------------------------------------
+
+tool_read(path: string, offset, limit: int): string
 {
 	bfd := bufio->open(path, Sys->OREAD);
 	if(bfd == nil)
 		return sys->sprint("Error: Could not open file %s: %r", path);
-
 	if(offset < 1)
 		offset = 1;
 	if(limit <= 0)
 		limit = 2000;
-
 	out := "";
 	lineno := 0;
 	emitted := 0;
@@ -445,7 +473,6 @@ tool_read(path: string, offset: int, limit: int): string
 			break;
 	}
 	bfd.close();
-
 	if(lineno == 0)
 		return "File is empty.";
 	if(emitted == 0)
@@ -453,7 +480,7 @@ tool_read(path: string, offset: int, limit: int): string
 	return out;
 }
 
-tool_write(path: string, content: string): string
+tool_write(path, content: string): string
 {
 	fd := sys->open(path, Sys->OWRITE | Sys->OTRUNC);
 	if(fd == nil) {
@@ -462,50 +489,39 @@ tool_write(path: string, content: string): string
 	}
 	if(fd == nil)
 		return sys->sprint("Error: Could not open or create file %s: %r", path);
-
 	buf := array of byte content;
-	n := sys->write(fd, buf, len buf);
-	if(n < 0)
+	if(sys->write(fd, buf, len buf) < 0)
 		return sys->sprint("Error writing to file: %r");
-
 	return "File written successfully.";
 }
 
-tool_edit(path: string, oldText: string, newText: string): string
+tool_edit(path, oldText, newText: string): string
 {
 	(content, err) := read_all(path);
 	if(err != nil)
 		return "Error: " + err;
-
 	(a, b) := str->splitstrl(content, oldText);
 	if(b == nil || len b == 0)
 		return "Error: oldText not found in file.";
-
 	after := b[len oldText:];
 	(nil, b2) := str->splitstrl(after, oldText);
 	if(b2 != nil && len b2 > 0)
 		return sys->sprint("Error: oldText matches more than once in %s; provide more surrounding context to make it unique.", path);
-
-	new_content := a + newText + after;
-
-	return tool_write(path, new_content);
+	return tool_write(path, a + newText + after);
 }
 
 tool_multi_edit(path: string, edits: ref JValue): string
 {
 	if(edits == nil || !edits.isarray())
 		return "Error: 'edits' must be a JSON array of {oldText, newText} objects";
-
 	arr: array of ref JValue;
 	pick ev := edits {
 	Array =>
 		arr = ev.a;
 	}
-
 	(content, err) := read_all(path);
 	if(err != nil)
 		return "Error: " + err;
-
 	for(i := 0; i < len arr; i++) {
 		e := arr[i];
 		if(e == nil || !e.isobject())
@@ -514,7 +530,6 @@ tool_multi_edit(path: string, edits: ref JValue): string
 		newText := get_string_arg(e, "newText");
 		if(oldText == nil || newText == nil)
 			return sys->sprint("Error: edit %d missing oldText or newText", i);
-
 		(a, b) := str->splitstrl(content, oldText);
 		if(b == nil || len b == 0)
 			return sys->sprint("Error: edit %d oldText not found", i);
@@ -524,22 +539,17 @@ tool_multi_edit(path: string, edits: ref JValue): string
 			return sys->sprint("Error: edit %d oldText matches more than once; provide more context", i);
 		content = a + newText + after;
 	}
-
 	return tool_write(path, content);
 }
 
 tool_shell(ctxt: ref Draw->Context, cmd: string, timeout: int): string
 {
-	sys->print("Running shell command: %s\n", cmd);
-
 	tmp := "/tmp/sh_out_" + string sys->millisec();
 	full := "{ " + cmd + " } > " + tmp + " >[2=1]";
-
 	res: string;
 	if(timeout <= 0) {
 		res = sh->system(ctxt, full);
-	}
-	else {
+	} else {
 		done := chan[1] of string;
 		timer := chan[1] of int;
 		spawn run_shell(ctxt, full, done);
@@ -552,15 +562,12 @@ tool_shell(ctxt: ref Draw->Context, cmd: string, timeout: int): string
 				return sys->sprint("Error: command timed out after %ds", timeout);
 		}
 	}
-
 	(output, rerr) := read_all(tmp);
 	sys->remove(tmp);
 	if(rerr != nil)
 		output = "";
-
 	if(res != nil)
 		return "Exit Status: " + res + "\n" + output;
-
 	if(len output == 0)
 		return "Command executed with no output.";
 	return output;
@@ -568,8 +575,7 @@ tool_shell(ctxt: ref Draw->Context, cmd: string, timeout: int): string
 
 run_shell(ctxt: ref Draw->Context, cmd: string, done: chan of string)
 {
-	r := sh->system(ctxt, cmd);
-	done <-= r;
+	done <-= sh->system(ctxt, cmd);
 }
 
 timer_fn(ms: int, c: chan of int)
@@ -585,11 +591,9 @@ tool_ls(path: string): string
 		return sys->sprint("Error: stat %s: %r", path);
 	if((d.mode & Sys->DMDIR) == 0)
 		return fmt_dir_entry(d) + "\n";
-
 	fd := sys->open(path, Sys->OREAD);
 	if(fd == nil)
 		return sys->sprint("Error: open %s: %r", path);
-
 	out := "";
 	for(;;) {
 		(n, a) := sys->dirread(fd);
@@ -611,7 +615,7 @@ fmt_dir_entry(d: Sys->Dir): string
 	return sys->sprint("%s %8bd %s", kind, d.length, d.name);
 }
 
-tool_glob(dir: string, pattern: string): string
+tool_glob(dir, pattern: string): string
 {
 	matches := glob_walk(dir, pattern, nil);
 	if(matches == nil)
@@ -633,7 +637,7 @@ tool_glob(dir: string, pattern: string): string
 	return out;
 }
 
-glob_walk(dir: string, pattern: string, acc: list of string): list of string
+glob_walk(dir, pattern: string, acc: list of string): list of string
 {
 	fd := sys->open(dir, Sys->OREAD);
 	if(fd == nil)
@@ -657,7 +661,7 @@ glob_walk(dir: string, pattern: string, acc: list of string): list of string
 	return acc;
 }
 
-glob_match(pat: string, name: string): int
+glob_match(pat, name: string): int
 {
 	if(pat == "*")
 		return 1;
@@ -678,7 +682,7 @@ glob_match(pat: string, name: string): int
 	return pat == name;
 }
 
-tool_grep(ctxt: ref Draw->Context, pattern: string, path: string): string
+tool_grep(ctxt: ref Draw->Context, pattern, path: string): string
 {
 	cmd := "grep -n " + shquote(pattern) + " " + shquote(path);
 	return tool_shell(ctxt, cmd, 0);
@@ -702,11 +706,9 @@ mkdirs(path: string): int
 	(n, parts) := sys->tokenize(path, "/");
 	if(n <= 1)
 		return 1;
-
 	dir := "";
 	if(path != nil && path[0] == '/')
 		dir = "/";
-
 	while(parts != nil && tl parts != nil) {
 		p := hd parts;
 		if(dir == "/")
@@ -715,7 +717,6 @@ mkdirs(path: string): int
 			dir += "/" + p;
 		else
 			dir = p;
-
 		(opt, d) := sys->stat(dir);
 		if(opt < 0) {
 			fd := sys->create(dir, Sys->OREAD, Sys->DMDIR | 8r777);
@@ -731,87 +732,125 @@ mkdirs(path: string): int
 	return 1;
 }
 
-append_msg(l: list of ref Message, m: ref Message): list of ref Message
-{
-	if(l == nil)
-		return m::nil;
-	return hd l::append_msg(tl l, m);
-}
-
-send_reset()
-{
-	cfd := sys->open(sys->sprint("/n/llm/%s/ctl", llmconn), Sys->OWRITE);
-	if(cfd != nil)
-		sys->fprint(cfd, "reset");
-}
-
-build_prompt(sys_prompt: string, history: list of ref Message): string
-{
-	p := "<start_of_turn>user\n" + sys_prompt + "\n";
-
-	in_user := 1;
-
-	q := history;
-	while(q != nil) {
-		m := hd q;
-		role := m.role;
-		
-		if (role == "user") {
-			if (!in_user) {
-				p += "<start_of_turn>user\n";
-				in_user = 1;
-			}
-			p += m.content + "\n";
-		} else {
-			if (in_user) {
-				p += "<end_of_turn>\n";
-				in_user = 0;
-			}
-			p += "<start_of_turn>model\n" + m.content + "<end_of_turn>\n";
-		}
-		q = tl q;
-	}
-	
-	if (in_user) {
-		p += "<end_of_turn>\n";
-	}
-
-	p += "<start_of_turn>model\n";
-	return p;
-}
-
-# 1 char roughly 0.3 tokens
-enforce_context_limit(sys_prompt: string, history: list of ref Message): list of ref Message
-{
-	for(;;) {
-		total_len := len sys_prompt;
-
-		q := history;
-		while(q != nil) {
-			m := hd q;
-			total_len += len m.role + len m.content + 40;
-			# some buffer for formatting
-			q = tl q;
-		}
-
-		est_tokens := total_len / 3;
-		if(est_tokens < max_context || history == nil)
-			break;
-
-		# pop oldest history element
-		history = tl history;
-	}
-	return history;
-}
-
-log_transcript(prompt: string)
+log_transcript(role, content: string)
 {
 	logfd := sys->open("transcript.log", Sys->OWRITE);
 	if(logfd == nil)
 		logfd = sys->create("transcript.log", Sys->OWRITE, 8r666);
-	if(logfd != nil) {
-		sys->seek(logfd, big 0, Sys->SEEKEND);
-		# We can use the current time if we load Daytime or just a separator
-		sys->fprint(logfd, "========== PROMPT ==========\n%s\n============================\n\n", prompt);
-	}
+	if(logfd == nil)
+		return;
+	sys->seek(logfd, big 0, Sys->SEEKEND);
+	sys->fprint(logfd, "========== %s ==========\n%s\n\n", role, content);
+}
+
+# --- defaults -----------------------------------------------------------
+
+default_system_prompt(): string
+{
+	return
+		"You are an expert coding assistant connected to an Inferno OS environment.\n" +
+		"You help users with coding tasks by reading files, executing commands, " +
+		"editing code, and writing new files.\n\n" +
+		"Use the provided tools (read, write, edit, multi_edit, shell, ls, glob, grep) " +
+		"via the function-calling protocol. Do not output JSON tool blocks in your text.\n\n" +
+		"Guidelines:\n" +
+		"- Use 'read' to examine files before editing them.\n" +
+		"- Use 'edit' for precise changes (oldText must match exactly and uniquely).\n" +
+		"- Use 'write' only for new files or full rewrites.\n" +
+		"- Use 'shell' for inferno shell operations not covered by the file tools.\n" +
+		"- Be concise. Show file paths clearly when working with files.\n" +
+		"- Documentation lives under /man.\n";
+}
+
+default_tools_md(): string
+{
+	return
+		"# read\n" +
+		"Read a text file. Returns lines [offset .. offset+limit-1] (1-indexed).\n" +
+		"Defaults: offset=1, limit=2000.\n" +
+		"\n" +
+		"```json\n" +
+		"{\"type\":\"object\"," +
+		 "\"properties\":{\"path\":{\"type\":\"string\"}," +
+		                  "\"offset\":{\"type\":\"integer\"}," +
+		                  "\"limit\":{\"type\":\"integer\"}}," +
+		 "\"required\":[\"path\"]}\n" +
+		"```\n" +
+		"\n" +
+		"# write\n" +
+		"Write content to a file, overwriting if it exists. Creates parent dirs.\n" +
+		"\n" +
+		"```json\n" +
+		"{\"type\":\"object\"," +
+		 "\"properties\":{\"path\":{\"type\":\"string\"}," +
+		                  "\"content\":{\"type\":\"string\"}}," +
+		 "\"required\":[\"path\",\"content\"]}\n" +
+		"```\n" +
+		"\n" +
+		"# edit\n" +
+		"Replace exact text in a file. oldText must match exactly and uniquely.\n" +
+		"\n" +
+		"```json\n" +
+		"{\"type\":\"object\"," +
+		 "\"properties\":{\"path\":{\"type\":\"string\"}," +
+		                  "\"oldText\":{\"type\":\"string\"}," +
+		                  "\"newText\":{\"type\":\"string\"}}," +
+		 "\"required\":[\"path\",\"oldText\",\"newText\"]}\n" +
+		"```\n" +
+		"\n" +
+		"# multi_edit\n" +
+		"Apply several edits to one file atomically. Each edit has the same\n" +
+		"uniqueness requirement as edit. Edits apply in order against the\n" +
+		"running buffer.\n" +
+		"\n" +
+		"```json\n" +
+		"{\"type\":\"object\"," +
+		 "\"properties\":{\"path\":{\"type\":\"string\"}," +
+		                  "\"edits\":{\"type\":\"array\"," +
+		                            "\"items\":{\"type\":\"object\"," +
+		                                       "\"properties\":{\"oldText\":{\"type\":\"string\"}," +
+		                                                        "\"newText\":{\"type\":\"string\"}}," +
+		                                       "\"required\":[\"oldText\",\"newText\"]}}}," +
+		 "\"required\":[\"path\",\"edits\"]}\n" +
+		"```\n" +
+		"\n" +
+		"# shell\n" +
+		"Execute an inferno shell command. Returns combined stdout+stderr.\n" +
+		"\n" +
+		"```json\n" +
+		"{\"type\":\"object\"," +
+		 "\"properties\":{\"command\":{\"type\":\"string\"}," +
+		                  "\"timeout\":{\"type\":\"integer\",\"description\":\"seconds; 0 = no timeout\"}}," +
+		 "\"required\":[\"command\"]}\n" +
+		"```\n" +
+		"\n" +
+		"# ls\n" +
+		"List a directory or stat a single file.\n" +
+		"\n" +
+		"```json\n" +
+		"{\"type\":\"object\"," +
+		 "\"properties\":{\"path\":{\"type\":\"string\"}}," +
+		 "\"required\":[\"path\"]}\n" +
+		"```\n" +
+		"\n" +
+		"# glob\n" +
+		"Recursively find files matching a basename pattern under dir.\n" +
+		"Pattern supports a single '*' as prefix or suffix. Capped at 500 results.\n" +
+		"\n" +
+		"```json\n" +
+		"{\"type\":\"object\"," +
+		 "\"properties\":{\"dir\":{\"type\":\"string\"}," +
+		                  "\"pattern\":{\"type\":\"string\"}}," +
+		 "\"required\":[\"dir\",\"pattern\"]}\n" +
+		"```\n" +
+		"\n" +
+		"# grep\n" +
+		"Regex search via inferno grep. Output is file:line:match.\n" +
+		"\n" +
+		"```json\n" +
+		"{\"type\":\"object\"," +
+		 "\"properties\":{\"pattern\":{\"type\":\"string\"}," +
+		                  "\"path\":{\"type\":\"string\"}}," +
+		 "\"required\":[\"pattern\",\"path\"]}\n" +
+		"```\n";
 }
